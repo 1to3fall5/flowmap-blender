@@ -102,9 +102,11 @@ def stroke(arr, p0, p1, radius, strength):
 def region_to_pixel(context, event, image, uv_mode=None):
     """Mouse position -> image pixel coords.
 
-    Returns (raw, pixel, uv_mode). Depending on the editor, view2d hands back
-    either pixel coords or normalised UV (0..1); we decide once from the
-    magnitude and remember it, so painting works either way.
+    Returns (raw, pixel, uv_mode). On Blender 4.5 the Image Editor's view2d hands
+    back NORMALISED UV (0..1), not pixels — which is why the first version drew
+    nothing at all: a 0.1 drag never cleared the minimum-distance check. We scale
+    to pixels, still detecting by magnitude in case a future release reports
+    pixels instead.
     """
     region = context.region
     if region is None:
@@ -159,20 +161,23 @@ class FLOW_OT_brush(bpy.types.Operator):
         self.last = None
         self.drawing = False
         self.uv_mode = None
+        self.adjust = None
         print("[FlowMap] brush started on %s" % (tuple(self.image.size),))
         context.window_manager.modal_handler_add(self)
         self.report_status(context, None)
         return {'RUNNING_MODAL'}
 
     def report_status(self, context, raw):
-        """Live coords in the status bar — fastest way to see what's happening."""
+        """Live values in the status bar — fastest way to see what's happening."""
         if not getattr(context, 'workspace', None):
             return
-        msg = "Flow Brush: LMB drag to paint, RMB/ESC to finish"
+        msg = ("Flow Brush [R=%d S=%.2f]  LMB drag to paint  |  "
+               "F+drag = radius  |  Shift+F+drag = strength") % (self.radius, self.strength)
+        if self.adjust:
+            msg += "   << adjusting %s >>" % self.adjust
         if raw is not None:
-            msg += "   raw=(%.3f, %.3f) uv_mode=%s drawing=%s" % (
+            msg += "   raw=(%.3f, %.3f) uv=%s draw=%s" % (
                 raw[0], raw[1], self.uv_mode, self.drawing)
-            print("[FlowMap] raw=%s uv_mode=%s drawing=%s" % (raw, self.uv_mode, self.drawing))
         context.workspace.status_text_set(msg)
 
     def finish(self, context):
@@ -184,6 +189,15 @@ class FLOW_OT_brush(bpy.types.Operator):
     def modal(self, context, event):
         if event.type in {'RIGHTMOUSE', 'ESC'}:
             return self.finish(context)
+
+        # Blender's own brush shortcuts: F sizes the brush, Shift+F is strength
+        if event.type == 'F':
+            if event.value == 'PRESS':
+                self.adjust = 'strength' if event.shift else 'radius'
+            elif event.value == 'RELEASE':
+                self.adjust = None
+            self.report_status(context, None)
+            return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
@@ -201,6 +215,19 @@ class FLOW_OT_brush(bpy.types.Operator):
 
         if event.type == 'MOUSEMOVE':
             raw, px, self.uv_mode = region_to_pixel(context, event, self.image, self.uv_mode)
+
+            if self.adjust is not None:
+                # accumulate from the per-event delta, like Blender's brush sizing
+                delta = event.mouse_x - event.mouse_prev_x
+                if self.adjust == 'radius':
+                    self.radius = max(1, min(512, self.radius + int(delta * 0.5)))
+                    context.scene.flow_brush_radius = self.radius
+                else:
+                    self.strength = max(0.0, min(1.0, self.strength + delta * 0.002))
+                    context.scene.flow_brush_strength = self.strength
+                self.report_status(context, raw)
+                return {'RUNNING_MODAL'}
+
             self.report_status(context, raw)
             if self.drawing and px is not None and self.last is not None:
                 if stroke(self.arr, self.last, px, self.radius, self.strength):
