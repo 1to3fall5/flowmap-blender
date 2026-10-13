@@ -373,7 +373,13 @@ class FLOW_OT_brush_native(bpy.types.Operator):
         """
         brush = bpy.data.brushes.get(BRUSH_NAME)
         if brush is None:
-            brush = bpy.data.brushes.new(BRUSH_NAME, mode='IMAGE_PAINT')
+            # Image painting uses the TEXTURE_PAINT brush type; there is no
+            # 'IMAGE_PAINT' enum entry. Fall back to the default mode if the
+            # keyword is ever rejected.
+            try:
+                brush = bpy.data.brushes.new(BRUSH_NAME, mode='TEXTURE_PAINT')
+            except TypeError:
+                brush = bpy.data.brushes.new(BRUSH_NAME)
         try:
             brush.texture = None
             brush.mask_texture = None
