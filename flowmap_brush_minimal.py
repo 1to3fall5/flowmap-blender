@@ -13,6 +13,8 @@ import bmesh
 import bpy
 import math
 import numpy as np
+from bpy_extras import view3d_utils
+from mathutils.geometry import barycentric_transform, closest_point_on_tri
 
 try:
     import gpu
@@ -49,8 +51,12 @@ def reset_canvas(img):
 
 
 def read_canvas(img):
+    # foreach_get, not np.array(img.pixels[:]) — the latter builds a Python list
+    # of a million floats and takes about a second on a 512² canvas.
     h, w = img.size[1], img.size[0]
-    return np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+    buf = np.empty(h * w * 4, dtype=np.float32)
+    img.pixels.foreach_get(buf)
+    return buf.reshape(h, w, 4)
 
 
 def write_canvas(img, arr):
@@ -914,7 +920,7 @@ class FLOW_OT_preview_build(bpy.types.Operator):
         else:
             obj.data.materials.append(mat)
         start_preview_timer()
-        self.report({'INFO'}, "预览已创建（贴图上半=地平线，顶部=天顶）")
+        self.report({'INFO'}, "预览已创建（画布底边=地平线，顶边=天顶）")
         return {'FINISHED'}
 
 
@@ -930,6 +936,264 @@ class FLOW_OT_preview_stop(bpy.types.Operator):
         if obj is not None:
             bpy.data.objects.remove(obj, do_unlink=True)
         return {'FINISHED'}
+
+
+# ------------------------------------------------------------- 3D painting
+#
+# Paint straight on the dome: cast the camera ray, interpolate the mesh UV at
+# the hit, write pixels there. The direction comes from the movement in UV
+# space, not on screen, so dragging sideways near the zenith produces the bigger
+# longitude change it should — on a sphere the same screen movement covers far
+# more texture up there.
+
+def draw_brush_ring(cx, cy, r, strength, report=None):
+    """Ring for the footprint, faint fill for the strength."""
+    if r < 1.0:
+        return
+    steps = 64
+    pts = []
+    for i in range(steps + 1):
+        a = 2.0 * math.pi * i / steps
+        pts.append((cx + math.cos(a) * r, cy + math.sin(a) * r, 0.0))
+    try:
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+    except Exception as err:
+        if report is not None:
+            report(err)
+        return
+    shader.bind()
+    try:
+        tris = []
+        for i in range(steps):
+            tris.append((cx, cy, 0.0))
+            tris.append(pts[i])
+            tris.append(pts[i + 1])
+        fill = batch_for_shader(shader, 'TRIS', {"pos": tris})
+        shader.uniform_float("color", (1.0, 1.0, 1.0, 0.02 + strength * 0.08))
+        fill.draw(shader)
+    except Exception as err:
+        if report is not None:
+            report(err)
+    try:
+        outline = batch_for_shader(shader, 'LINE_STRIP', {"pos": pts})
+        shader.uniform_float("color", (1.0, 1.0, 1.0, 0.9))
+        outline.draw(shader)
+    except Exception as err:
+        if report is not None:
+            report(err)
+    try:
+        gpu.state.blend_set('NONE')
+    except Exception:
+        pass
+
+
+def uv_on_dome(mesh, face_index, point):
+    """Mesh UV at a point inside a face, by barycentric interpolation.
+
+    Interpolating the real UVs beats deriving them from the sphere analytically:
+    this way the u orientation cannot be guessed wrong.
+    """
+    poly = mesh.polygons[face_index]
+    uv_layer = mesh.uv_layers.active
+    if uv_layer is None or len(poly.loop_indices) < 3:
+        return None
+
+    def co(loop_index):
+        return mesh.vertices[mesh.loops[loop_index].vertex_index].co
+
+    loops = list(poly.loop_indices)
+    best, best_dist = None, None
+    for i in range(1, len(loops) - 1):                 # fan triangulation
+        tri = (loops[0], loops[i], loops[i + 1])
+        a, b, c = co(tri[0]), co(tri[1]), co(tri[2])
+        d = (closest_point_on_tri(point, a, b, c) - point).length
+        if best_dist is None or d < best_dist:
+            best, best_dist = tri, d
+    if best is None:
+        return None
+    # barycentric_transform wants the source and target in the same dimension,
+    # so the 2D UVs are lifted to 3D for the call.
+    uv = barycentric_transform(point, co(best[0]), co(best[1]), co(best[2]),
+                               uv_layer.data[best[0]].uv.to_3d(),
+                               uv_layer.data[best[1]].uv.to_3d(),
+                               uv_layer.data[best[2]].uv.to_3d())
+    return (uv.x, uv.y)
+
+
+def dome_pick(context, obj, event):
+    """Screen position -> (u, v) on the dome in canvas space, or None."""
+    region = context.region
+    space = getattr(context, 'space_data', None)
+    rv3d = getattr(space, 'region_3d', None) if space is not None else None
+    if region is None or rv3d is None:
+        return None
+    mx, my = event.mouse_region_x, event.mouse_region_y
+    origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, (mx, my))
+    direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, (mx, my))
+    if origin is None or direction is None:
+        return None
+
+    inv = obj.matrix_world.inverted()
+    hit, loc, _normal, face_index = obj.ray_cast(inv @ origin, inv.to_3x3() @ direction)
+    if not hit or face_index is None or face_index < 0:
+        return None
+    uv = uv_on_dome(obj.data, face_index, loc)
+    if uv is None:
+        return None
+    # Blender's sphere UVs run v = 0 at the south pole, so the hemisphere
+    # occupies 0.5..1 — the same remap the preview shader applies. Result:
+    # v = 0 horizon, v = 1 zenith.
+    return (uv[0], min(1.0, max(0.0, (uv[1] - 0.5) * 2.0)))
+
+
+class FLOW_OT_brush_3d(bpy.types.Operator):
+    """Paint the flow map by dragging on the preview dome"""
+    bl_idname = "flow.brush_3d"
+    bl_label = "Paint on Dome"
+    bl_description = "Drag on the preview dome to paint flow straight into the map"
+    bl_options = {'REGISTER'}
+
+    strength: bpy.props.FloatProperty(name="Strength", default=0.5, min=0.01, max=1.0)
+    radius: bpy.props.IntProperty(name="Radius", default=40, min=1, max=512)
+
+    def invoke(self, context, event):
+        self.image = get_or_create_canvas()
+        obj = bpy.data.objects.get(PREVIEW_OBJ)
+        if obj is None:
+            obj = build_preview_dome()
+        if obj is None:
+            self.report({'ERROR'}, "没有可绘制的天空球")
+            return {'CANCELLED'}
+        self.obj = obj
+        self.arr = read_canvas(self.image)
+
+        self.pressing = False
+        self.last_pixel = None
+        self.cursor_screen = (event.mouse_region_x, event.mouse_region_y)
+        self.adjust = None
+        self.adjust_start = None
+        self._draw_handle = None
+        if GPU_AVAILABLE:
+            self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+                self.draw_cursor, (context,), 'WINDOW', 'POST_PIXEL')
+        context.window_manager.modal_handler_add(self)
+        self.report_status(context)
+        return {'RUNNING_MODAL'}
+
+    def report_status(self, context):
+        if not getattr(context, 'workspace', None):
+            return
+        msg = ("Flow Brush 3D [R=%d S=%.2f]  LMB drag on the dome  |  "
+               "F+drag = radius  |  Shift+F+drag = strength  |  RMB/ESC = exit"
+               % (self.radius, self.strength))
+        if self.adjust is not None:
+            msg = "-- adjusting %s --" % self.adjust
+        context.workspace.status_text_set(msg)
+
+    def draw_cursor(self, context):
+        if self.cursor_screen is None:
+            return
+        draw_brush_ring(self.cursor_screen[0], self.cursor_screen[1],
+                        float(self.radius), self.strength, self.note_draw_error)
+
+    def note_draw_error(self, err):
+        if getattr(self, '_draw_error_reported', False):
+            return
+        self._draw_error_reported = True
+        print("[FlowMap] dome brush overlay failed: %r" % (err,))
+
+    def remove_cursor(self):
+        handle = getattr(self, '_draw_handle', None)
+        if handle is not None:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(handle, 'WINDOW')
+            except Exception:
+                pass
+            self._draw_handle = None
+
+    def finish(self, context):
+        self.remove_cursor()
+        write_canvas(self.image, self.arr)
+        if getattr(context, 'workspace', None):
+            context.workspace.status_text_set(None)
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            return self.finish(context)
+
+        if event.type == 'F':
+            if event.value == 'PRESS' and self.adjust is None:
+                self.adjust = 'Strength' if event.shift else 'Radius'
+                start = self.strength if self.adjust == 'Strength' else self.radius
+                self.adjust_start = (event.mouse_x, start)
+            elif event.value == 'RELEASE':
+                self.adjust = None
+                self.adjust_start = None
+            self.report_status(context)
+            if context.area:
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'LEFTMOUSE':
+            if event.value == 'PRESS':
+                self.pressing = True
+                self.last_pixel = None
+            elif event.value == 'RELEASE':
+                self.pressing = False
+                self.last_pixel = None
+                write_canvas(self.image, self.arr)
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'MOUSEMOVE':
+            self.cursor_screen = (event.mouse_region_x, event.mouse_region_y)
+
+            if self.adjust is not None and self.adjust_start is not None:
+                dx = event.mouse_x - self.adjust_start[0]
+                if self.adjust == 'Radius':
+                    self.radius = max(1, int(self.adjust_start[1] + dx))
+                else:
+                    self.strength = min(1.0, max(0.01,
+                                                 self.adjust_start[1] + dx * 0.005))
+                self.report_status(context)
+                if context.area:
+                    context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+
+            if self.pressing:
+                uv = dome_pick(context, self.obj, event)
+                if uv is not None:
+                    w, h = self.image.size[0], self.image.size[1]
+                    px = (uv[0] * w, uv[1] * h)
+                    if self.last_pixel is not None:
+                        raw_du = px[0] - self.last_pixel[0]
+                        du = raw_du
+                        # the u direction wraps at the back of the dome
+                        if du > w * 0.5:
+                            du -= w
+                        elif du < -w * 0.5:
+                            du += w
+                        dv = px[1] - self.last_pixel[1]
+                        p1 = (self.last_pixel[0] + du, self.last_pixel[1] + dv)
+                        shifts = [0.0]
+                        if abs(du - raw_du) > 1e-6:      # straddled the seam
+                            shifts.append(-w if raw_du > 0 else w)
+                        for s in shifts:
+                            stroke(self.arr,
+                                   (self.last_pixel[0] + s, self.last_pixel[1]),
+                                   (p1[0] + s, p1[1]),
+                                   self.radius, self.strength)
+                        write_canvas(self.image, self.arr)
+                    self.last_pixel = px
+
+            if context.area:
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        return {'PASS_THROUGH'}
 
 
 class FLOW_PT_panel(bpy.types.Panel):
@@ -952,11 +1216,14 @@ class FLOW_PT_panel(bpy.types.Panel):
         layout.separator()
         layout.label(text="Preview")
         layout.operator("flow.preview_build", icon='WORLD')
+        op3d = layout.operator("flow.brush_3d", icon='BRUSH_DATA')
+        op3d.strength = context.scene.flow_brush_strength
         layout.operator("flow.preview_stop", icon='CANCEL')
 
 
 classes = (FLOW_OT_new_canvas, FLOW_OT_brush, FLOW_OT_brush_native,
-           FLOW_OT_preview_build, FLOW_OT_preview_stop, FLOW_PT_panel)
+           FLOW_OT_preview_build, FLOW_OT_preview_stop, FLOW_OT_brush_3d,
+           FLOW_PT_panel)
 
 
 def register():
