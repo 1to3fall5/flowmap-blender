@@ -395,6 +395,18 @@ class FLOW_OT_brush_native(bpy.types.Operator):
             brush.mask_texture = None
         except Exception:
             pass
+        # Blender's paint cursor is three stacked overlays: the ring
+        # (use_cursor_overlay), the texture preview (use_primary_overlay) and the
+        # mask preview (use_secondary_overlay). The texture one is drawn as a
+        # square that sits on top of the ring, and clearing brush.texture does
+        # not remove it — the overlay has to be switched off explicitly. We turn
+        # all three off and draw our own ring instead.
+        try:
+            brush.use_cursor_overlay = False
+            brush.use_primary_overlay = False
+            brush.use_secondary_overlay = False
+        except Exception:
+            pass
         if ip is not None:
             try:
                 ip.brush = brush
@@ -432,10 +444,24 @@ class FLOW_OT_brush_native(bpy.types.Operator):
         self.pressing = False
         self.last_mouse = None     # window coords — the direction comes from these
         self.last_dot = None       # where the previous dab landed
+
+        # Our own brush overlay, since Blender's is switched off above
+        self.cursor_screen = (event.mouse_region_x, event.mouse_region_y)
+        self.adjust = None
+        self.adjust_start = None
+        self._draw_handle = None
+        if GPU_AVAILABLE:
+            self._draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
+                self.draw_cursor, (context,), 'WINDOW', 'POST_PIXEL')
+
         context.window_manager.modal_handler_add(self)
+        self.report_status(context)
         return {'RUNNING_MODAL'}
 
     def finish(self, context):
+        self.remove_cursor()
+        if getattr(context, 'workspace', None):
+            context.workspace.status_text_set(None)
         try:
             self.ups.color = (0.5, 0.5, 1.0)
         except Exception:
@@ -485,9 +511,73 @@ class FLOW_OT_brush_native(bpy.types.Operator):
             self.place_dot(context, (self.last_dot[0] + dx * t, self.last_dot[1] + dy * t))
         self.last_dot = mouse
 
+    # --- brush overlay ---
+    # Blender's own overlays are switched off in ensure_brush, so this mirrors
+    # them: a ring for the footprint and a fill whose opacity tracks strength.
+    def report_status(self, context):
+        """Live values in the status bar — the ring alone can't show numbers."""
+        if not getattr(context, 'workspace', None):
+            return
+        msg = ("Flow Brush [Size=%d  Strength=%.2f]  LMB drag = paint  |  "
+               "F+drag = size  |  Shift+F+drag = strength  |  RMB/ESC = exit"
+               ) % (int(self.ups.size), self.strength)
+        if self.adjust is not None:
+            msg = "-- adjusting %s --" % self.adjust
+        context.workspace.status_text_set(msg)
+
+    def remove_cursor(self):
+        handle = getattr(self, '_draw_handle', None)
+        if handle is not None:
+            try:
+                bpy.types.SpaceImageEditor.draw_handler_remove(handle, 'WINDOW')
+            except Exception:
+                pass
+            self._draw_handle = None
+
+    def draw_cursor(self, context):
+        if self.cursor_screen is None:
+            return
+        cx, cy = self.cursor_screen
+        r = max(2.0, self.ups.size * 0.5)   # brush size is already in screen px
+        steps = 64
+        ring = []
+        for i in range(steps + 1):
+            a = 2.0 * math.pi * i / steps
+            ring.append((cx + math.cos(a) * r, cy + math.sin(a) * r, 0.0))
+        try:
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+            gpu.state.blend_set('ALPHA')
+
+            fan = [(cx, cy, 0.0)] + ring[:-1]      # TRI_FAN needs the centre first
+            fill = batch_for_shader(shader, 'TRI_FAN', {"pos": fan})
+            outline = batch_for_shader(shader, 'LINE_STRIP', {"pos": ring})
+
+            shader.bind()
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.04 + self.strength * 0.16))
+            fill.draw(shader)
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.9))
+            outline.draw(shader)
+
+            gpu.state.blend_set('NONE')
+        except Exception:
+            pass
+
     def modal(self, context, event):
         if event.type in {'RIGHTMOUSE', 'ESC'}:
             return self.finish(context)
+
+        if event.type == 'F':
+            if event.value == 'PRESS' and self.adjust is None:
+                self.adjust = 'Strength' if event.shift else 'Size'
+                start = self.strength if self.adjust == 'Strength' else self.ups.size
+                self.adjust_start = (event.mouse_x, start)
+            elif event.value == 'RELEASE':
+                self.adjust = None
+                self.adjust_start = None
+            self.report_status(context)
+            if context.area:
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
@@ -500,6 +590,20 @@ class FLOW_OT_brush_native(bpy.types.Operator):
 
         if event.type == 'MOUSEMOVE':
             mouse = (event.mouse_x, event.mouse_y)
+            self.cursor_screen = (event.mouse_region_x, event.mouse_region_y)
+
+            # F / Shift+F held: drag horizontally to change the value, no painting
+            if self.adjust is not None and self.adjust_start is not None:
+                dx = event.mouse_x - self.adjust_start[0]
+                if self.adjust == 'Size':
+                    self.ups.size = max(1, int(self.adjust_start[1] + dx))
+                else:
+                    self.strength = min(1.0, max(0.01,
+                                                 self.adjust_start[1] + dx * 0.005))
+                self.report_status(context)
+                if context.area:
+                    context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
 
             if self.last_mouse is not None:
                 dx = mouse[0] - self.last_mouse[0]
