@@ -15,25 +15,11 @@ Blender → Edit → Preferences → Add-ons → **Install** → pick
 
 1. Switch to the **Image Editor**, press `N` to open the sidebar → **FlowMap** tab
 2. **New FlowMap** — create (or reset) the canvas, filled with neutral `(128,128,255)`
-3. Pick a brush mode (see [Two brush modes](#two-brush-modes))
-4. **Hold LMB and drag** to paint; RMB or `ESC` to finish
+3. **Flow Brush (Native Paint)** — puts the editor into Paint mode; **hold LMB and drag** to paint
+4. RMB or `ESC` to finish
 
-## Two brush modes
-
-| | **Flow Brush** | **Flow Brush (Native Paint)** |
-| :--- | :--- | :--- |
-| Who draws | the add-on, with numpy | Blender's paint engine |
-| Dab shape / hardness / pen pressure | fixed soft round | whatever the active brush has |
-| `F` / `Shift`+`F` | implemented here | Blender's own |
-| Cursor ring | custom overlay | Blender's `draw_circle_2d` |
-
-**Strength means flow strength in both modes** — how far the encoded direction
-deviates from neutral. It is deliberately kept separate from Blender's brush
-strength, which only controls dab opacity; sharing one value would attenuate
-twice and low values would paint almost nothing.
-
-The native mode is the more complete one. The numpy mode is a self-contained
-fallback that does not depend on the paint engine.
+Because it runs inside Blender's paint mode you get the native brush cursor, and
+`F` / `Shift`+`F` are Blender's own sizing keys.
 
 ## Shortcuts
 
@@ -52,17 +38,14 @@ Same as Blender's own paint brushes.
 These match the web version, [skyflow-designer](https://github.com/1to3fall5/skyflow-designer),
 so flow maps can be moved between the two.
 
-## Why the direction can't come from the brush
+## How it works
 
-Blender's brushes write a *colour*, while a flow map needs a *direction vector*
-that changes with every stroke. The trick is to recompute the brush colour from
-the drag direction on every mouse move — Blender still builds the dab (shape,
-hardness, pressure, spacing), it just never gets to choose the colour.
+Blender's brushes write a *colour*, but a flow map needs a *direction vector*
+that changes with every stroke. So the add-on recomputes the brush colour from
+the drag direction on every mouse move and lets Blender's paint engine handle
+the stroke — dab shape, hardness and pressure are Blender's own, the colour is
+ours.
 
-The technique follows Clemens Beute's
-[flow_map_painter](https://github.com/ClemensBeute/flow_map_painter): write to
-`tool_settings.unified_paint_settings.color` and drive
-`bpy.ops.paint.image_paint()` with an explicit stroke.
-
-The numpy mode instead writes pixels directly, bypassing the paint engine
-altogether.
+A numpy-based operator (`flow.brush`) that writes pixels directly is still in the
+file and can be reached via F3 search for "Flow Brush", but it is not shown in
+the panel.
