@@ -171,10 +171,17 @@ class FLOW_OT_brush(bpy.types.Operator):
         self.adjust = None
         self.cursor_screen = None
         self.cursor_radius_screen = 0.0
+        self.cursor_raw = None      # brush centre in view2d coords
         self._draw_handle = None
         if GPU_AVAILABLE:
             self._draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
                 self.draw_cursor, (context,), 'WINDOW', 'POST_PIXEL')
+        # The one piece we CAN borrow from Blender: its native brush pointer
+        if getattr(context, 'window', None):
+            try:
+                context.window.cursor_modal_set('PAINT_BRUSH')
+            except Exception:
+                pass
         print("[FlowMap] brush started on %s" % (tuple(self.image.size),))
         context.window_manager.modal_handler_add(self)
         self.report_status(context, None)
@@ -195,6 +202,11 @@ class FLOW_OT_brush(bpy.types.Operator):
 
     def finish(self, context):
         self.remove_cursor()
+        if getattr(context, 'window', None):
+            try:
+                context.window.cursor_modal_restore()
+            except Exception:
+                pass
         write_canvas(self.image, self.arr)
         if getattr(context, 'workspace', None):
             context.workspace.status_text_set(None)
@@ -211,17 +223,25 @@ class FLOW_OT_brush(bpy.types.Operator):
                 pass
             self._draw_handle = None
 
-    def update_cursor(self, context, event, raw):
-        """Brush ring position/size in region pixels — follows the view zoom."""
+    def update_cursor(self, context, event, raw=None):
+        """Brush ring position/size in region pixels — follows the view zoom.
+
+        Pass raw=None to keep the centre where it is and only recompute the
+        radius. That's what sizing does: the brush grows in place while the
+        mouse only supplies a delta.
+        """
         region = context.region
-        if region is None or raw is None:
+        if raw is not None:
+            self.cursor_raw = raw
+        if region is None or self.cursor_raw is None:
             self.cursor_screen = None
             return
         w = self.image.size[0]
         view2d = getattr(region, 'view2d', None)
         if view2d is not None and hasattr(view2d, 'view_to_region'):
-            center = view2d.view_to_region(raw[0], raw[1], clip=False)
-            edge = view2d.view_to_region(raw[0] + self.radius / w, raw[1], clip=False)
+            center = view2d.view_to_region(self.cursor_raw[0], self.cursor_raw[1], clip=False)
+            edge = view2d.view_to_region(self.cursor_raw[0] + self.radius / w,
+                                         self.cursor_raw[1], clip=False)
             self.cursor_screen = center
             self.cursor_radius_screen = abs(edge[0] - center[0])
         else:
@@ -229,22 +249,36 @@ class FLOW_OT_brush(bpy.types.Operator):
             self.cursor_radius_screen = self.radius / w * region.width
 
     def draw_cursor(self, context):
-        """GPU overlay: a ring showing the brush footprint."""
+        """GPU overlay: ring for the footprint, faint fill for the strength.
+
+        Blender draws its brush cursor inside the paint system, so there is no
+        Python API to reuse it — this mirrors the look instead: an outline for
+        the size and a fill whose opacity tracks strength.
+        """
         if self.cursor_screen is None or self.cursor_radius_screen < 1.0:
             return
         cx, cy = self.cursor_screen
         r = self.cursor_radius_screen
         steps = 64
-        coords = []
+        ring = []
         for i in range(steps + 1):
             a = 2.0 * math.pi * i / steps
-            coords.append((cx + math.cos(a) * r, cy + math.sin(a) * r, 0.0))
+            ring.append((cx + math.cos(a) * r, cy + math.sin(a) * r, 0.0))
         try:
             shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-            batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": coords})
+            gpu.state.blend_set('ALPHA')
+
+            fan = [(cx, cy, 0.0)] + ring[:-1]      # TRI_FAN needs the centre first
+            fill = batch_for_shader(shader, 'TRI_FAN', {"pos": fan})
             shader.bind()
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.04 + self.strength * 0.16))
+            fill.draw(shader)
+
+            outline = batch_for_shader(shader, 'LINE_STRIP', {"pos": ring})
             shader.uniform_float("color", (1.0, 1.0, 1.0, 0.9))
-            batch.draw(shader)
+            outline.draw(shader)
+
+            gpu.state.blend_set('NONE')
         except Exception:
             pass
 
@@ -287,7 +321,7 @@ class FLOW_OT_brush(bpy.types.Operator):
                 else:
                     self.strength = max(0.0, min(1.0, self.strength + delta * 0.002))
                     context.scene.flow_brush_strength = self.strength
-                self.update_cursor(context, event, raw)
+                self.update_cursor(context, event)   # centre stays put
                 if context.region:
                     context.region.tag_redraw()
                 self.report_status(context, raw)
