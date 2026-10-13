@@ -15,8 +15,11 @@ Blender → Edit → Preferences → Add-ons → **Install** → pick
 
 1. Switch to the **Image Editor**, press `N` to open the sidebar → **FlowMap** tab
 2. **New FlowMap** — create (or reset) the canvas, filled with neutral `(128,128,255)`
-3. **Flow Brush** — enter paint mode, then **hold LMB and drag** to paint
+3. **Flow Brush** — enter paint mode. A ring shows the brush footprint; **hold LMB and drag** to paint
 4. RMB or `ESC` to finish
+
+The ring is drawn as a GPU overlay and follows the view zoom, so `F` / `Shift`+`F`
+sizing can be judged by eye.
 
 ## Shortcuts
 

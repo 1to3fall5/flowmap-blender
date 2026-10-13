@@ -13,6 +13,13 @@ import bpy
 import math
 import numpy as np
 
+try:
+    import gpu
+    from gpu_extras.batch import batch_for_shader
+    GPU_AVAILABLE = True
+except Exception:      # headless runs have no GL context
+    GPU_AVAILABLE = False
+
 CANVAS_NAME = "FlowMap"
 CANVAS_SIZE = 512
 
@@ -162,6 +169,12 @@ class FLOW_OT_brush(bpy.types.Operator):
         self.drawing = False
         self.uv_mode = None
         self.adjust = None
+        self.cursor_screen = None
+        self.cursor_radius_screen = 0.0
+        self._draw_handle = None
+        if GPU_AVAILABLE:
+            self._draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
+                self.draw_cursor, (context,), 'WINDOW', 'POST_PIXEL')
         print("[FlowMap] brush started on %s" % (tuple(self.image.size),))
         context.window_manager.modal_handler_add(self)
         self.report_status(context, None)
@@ -181,10 +194,59 @@ class FLOW_OT_brush(bpy.types.Operator):
         context.workspace.status_text_set(msg)
 
     def finish(self, context):
+        self.remove_cursor()
         write_canvas(self.image, self.arr)
         if getattr(context, 'workspace', None):
             context.workspace.status_text_set(None)
+        if context.area:
+            context.area.tag_redraw()
         return {'FINISHED'}
+
+    def remove_cursor(self):
+        handle = getattr(self, '_draw_handle', None)
+        if handle is not None:
+            try:
+                bpy.types.SpaceImageEditor.draw_handler_remove(handle, 'WINDOW')
+            except Exception:
+                pass
+            self._draw_handle = None
+
+    def update_cursor(self, context, event, raw):
+        """Brush ring position/size in region pixels — follows the view zoom."""
+        region = context.region
+        if region is None or raw is None:
+            self.cursor_screen = None
+            return
+        w = self.image.size[0]
+        view2d = getattr(region, 'view2d', None)
+        if view2d is not None and hasattr(view2d, 'view_to_region'):
+            center = view2d.view_to_region(raw[0], raw[1], clip=False)
+            edge = view2d.view_to_region(raw[0] + self.radius / w, raw[1], clip=False)
+            self.cursor_screen = center
+            self.cursor_radius_screen = abs(edge[0] - center[0])
+        else:
+            self.cursor_screen = (event.mouse_region_x, event.mouse_region_y)
+            self.cursor_radius_screen = self.radius / w * region.width
+
+    def draw_cursor(self, context):
+        """GPU overlay: a ring showing the brush footprint."""
+        if self.cursor_screen is None or self.cursor_radius_screen < 1.0:
+            return
+        cx, cy = self.cursor_screen
+        r = self.cursor_radius_screen
+        steps = 64
+        coords = []
+        for i in range(steps + 1):
+            a = 2.0 * math.pi * i / steps
+            coords.append((cx + math.cos(a) * r, cy + math.sin(a) * r, 0.0))
+        try:
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+            batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": coords})
+            shader.bind()
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.9))
+            batch.draw(shader)
+        except Exception:
+            pass
 
     def modal(self, context, event):
         if event.type in {'RIGHTMOUSE', 'ESC'}:
@@ -225,9 +287,15 @@ class FLOW_OT_brush(bpy.types.Operator):
                 else:
                     self.strength = max(0.0, min(1.0, self.strength + delta * 0.002))
                     context.scene.flow_brush_strength = self.strength
+                self.update_cursor(context, event, raw)
+                if context.region:
+                    context.region.tag_redraw()
                 self.report_status(context, raw)
                 return {'RUNNING_MODAL'}
 
+            self.update_cursor(context, event, raw)
+            if context.region:
+                context.region.tag_redraw()
             self.report_status(context, raw)
             if self.drawing and px is not None and self.last is not None:
                 if stroke(self.arr, self.last, px, self.radius, self.strength):
