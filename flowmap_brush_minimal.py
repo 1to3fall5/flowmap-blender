@@ -540,20 +540,29 @@ class FLOW_OT_brush_native(bpy.types.Operator):
         cx, cy = self.cursor_screen
         r = max(2.0, self.ups.size * 0.5)   # brush size is already in screen px
         steps = 64
-        ring = []
+        pts = []
         for i in range(steps + 1):
             a = 2.0 * math.pi * i / steps
-            ring.append((cx + math.cos(a) * r, cy + math.sin(a) * r, 0.0))
+            pts.append((cx + math.cos(a) * r, cy + math.sin(a) * r, 0.0))
         try:
             shader = gpu.shader.from_builtin('UNIFORM_COLOR')
             gpu.state.blend_set('ALPHA')
+            gpu.state.face_set('NONE')   # a stale cull state eats fan triangles
 
-            fan = [(cx, cy, 0.0)] + ring[:-1]      # TRI_FAN needs the centre first
-            fill = batch_for_shader(shader, 'TRI_FAN', {"pos": fan})
-            outline = batch_for_shader(shader, 'LINE_STRIP', {"pos": ring})
+            # Explicit triangles instead of TRI_FAN: the fan rendered with a
+            # missing wedge (background showing through) on some setups.
+            tris = []
+            for i in range(steps):
+                tris.append((cx, cy, 0.0))
+                tris.append(pts[i])
+                tris.append(pts[i + 1])
+            fill = batch_for_shader(shader, 'TRIS', {"pos": tris})
+            outline = batch_for_shader(shader, 'LINE_STRIP', {"pos": pts})
 
             shader.bind()
-            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.04 + self.strength * 0.16))
+            # A hint, not a sticker: overlays are drawn linear and then get the
+            # sRGB transform, so even 0.10 alpha reads as a solid grey disc.
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.02 + self.strength * 0.08))
             fill.draw(shader)
             shader.uniform_float("color", (1.0, 1.0, 1.0, 0.9))
             outline.draw(shader)
