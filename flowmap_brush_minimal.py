@@ -364,34 +364,42 @@ class FLOW_OT_brush_native(bpy.types.Operator):
     strength: bpy.props.FloatProperty(name="Strength", default=0.5, min=0.01, max=1.0)
 
     def ensure_brush(self, context):
-        """Use our own brush instead of whatever was last active.
+        """Paint with our own brush, cloned from the active one.
 
         A brush carrying a texture makes Blender draw a square texture preview
-        that sits right on top of the cursor ring, which is what makes the
-        sizing overlay look blocked. Creating a dedicated texture-free brush
-        also means we never disturb the user's own brushes.
+        that sits right on top of the cursor ring. We clone the active brush so
+        every other setting keeps behaving exactly as it does now, strip the
+        texture, and leave the user's own brush untouched.
         """
+        ip = getattr(context.tool_settings, 'image_paint', None)
+        src = getattr(ip, 'brush', None) if ip is not None else None
+
         brush = bpy.data.brushes.get(BRUSH_NAME)
         if brush is None:
-            # Image painting uses the TEXTURE_PAINT brush type; there is no
-            # 'IMAGE_PAINT' enum entry. Fall back to the default mode if the
-            # keyword is ever rejected.
-            try:
-                brush = bpy.data.brushes.new(BRUSH_NAME, mode='TEXTURE_PAINT')
-            except TypeError:
-                brush = bpy.data.brushes.new(BRUSH_NAME)
+            # Clone the active brush rather than making a fresh one: a blank
+            # brush has defaults (tool, curve, pressure flags) that do not
+            # necessarily paint here. Cloning keeps everything that already
+            # works and we only strip the texture.
+            if src is not None:
+                brush = src.copy()
+                brush.name = BRUSH_NAME
+            else:
+                # Image painting uses the TEXTURE_PAINT brush type; there is no
+                # 'IMAGE_PAINT' enum entry.
+                try:
+                    brush = bpy.data.brushes.new(BRUSH_NAME, mode='TEXTURE_PAINT')
+                except TypeError:
+                    brush = bpy.data.brushes.new(BRUSH_NAME)
         try:
             brush.texture = None
             brush.mask_texture = None
-            brush.blend = 'MIX'
-            brush.use_pressure_strength = True
-            brush.use_pressure_size = False
         except Exception:
             pass
-        try:
-            context.tool_settings.image_paint.brush = brush
-        except Exception:
-            pass
+        if ip is not None:
+            try:
+                ip.brush = brush
+            except Exception:
+                pass
         return brush
 
     def invoke(self, context, event):
