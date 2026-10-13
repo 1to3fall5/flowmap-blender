@@ -357,6 +357,12 @@ class FLOW_OT_brush_native(bpy.types.Operator):
     bl_description = "Uses Blender's paint engine — native brush settings, pressure and cursor"
     bl_options = {'REGISTER'}
 
+    # Flow strength: how far the encoded direction deviates from neutral.
+    # Deliberately NOT unified_paint_settings.strength, which Blender also
+    # applies as dab opacity — using it for both attenuates twice and low
+    # values paint almost nothing.
+    strength: bpy.props.FloatProperty(name="Strength", default=0.5, min=0.01, max=1.0)
+
     def invoke(self, context, event):
         self.image = get_or_create_canvas()
         space = getattr(context, 'space_data', None)
@@ -508,7 +514,7 @@ class FLOW_OT_brush_native(bpy.types.Operator):
                 dy = mouse[1] - self.last_mouse[1]
                 if math.hypot(dx, dy) > 0.0:
                     # window Y grows upward, and so do image rows
-                    r, g, b = direction_to_rgb(dx, dy, max(0.01, self.ups.strength))
+                    r, g, b = direction_to_rgb(dx, dy, self.strength)
                     try:
                         self.ups.color = (r, g, b)
                     except Exception:
@@ -546,8 +552,9 @@ class FLOW_PT_panel(bpy.types.Panel):
         layout.prop(context.scene, "flow_brush_strength")
 
         layout.separator()
-        layout.label(text="Native paint (Blender draws, we set colour):")
-        layout.operator("flow.brush_native", icon='BRUSH_DATA')
+        layout.label(text="Native paint (Blender's engine draws the dab):")
+        op_native = layout.operator("flow.brush_native", icon='BRUSH_DATA')
+        op_native.strength = context.scene.flow_brush_strength
 
 
 classes = (FLOW_OT_new_canvas, FLOW_OT_brush, FLOW_OT_brush_native, FLOW_PT_panel)
