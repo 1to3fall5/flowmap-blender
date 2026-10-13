@@ -22,6 +22,7 @@ except Exception:      # headless runs have no GL context
 
 CANVAS_NAME = "FlowMap"
 CANVAS_SIZE = 512
+BRUSH_NAME = "FlowMapBrush"
 
 # Neutral flow: R=G=128 encodes "no direction", B=255 encodes "fully mobile".
 NEUTRAL = (128.0 / 255.0, 128.0 / 255.0, 1.0, 1.0)
@@ -362,6 +363,31 @@ class FLOW_OT_brush_native(bpy.types.Operator):
     # opacity — using it for both attenuates twice and low values paint nothing.
     strength: bpy.props.FloatProperty(name="Strength", default=0.5, min=0.01, max=1.0)
 
+    def ensure_brush(self, context):
+        """Use our own brush instead of whatever was last active.
+
+        A brush carrying a texture makes Blender draw a square texture preview
+        that sits right on top of the cursor ring, which is what makes the
+        sizing overlay look blocked. Creating a dedicated texture-free brush
+        also means we never disturb the user's own brushes.
+        """
+        brush = bpy.data.brushes.get(BRUSH_NAME)
+        if brush is None:
+            brush = bpy.data.brushes.new(BRUSH_NAME, mode='IMAGE_PAINT')
+        try:
+            brush.texture = None
+            brush.mask_texture = None
+            brush.blend = 'MIX'
+            brush.use_pressure_strength = True
+            brush.use_pressure_size = False
+        except Exception:
+            pass
+        try:
+            context.tool_settings.image_paint.brush = brush
+        except Exception:
+            pass
+        return brush
+
     def invoke(self, context, event):
         self.image = get_or_create_canvas()
         space = getattr(context, 'space_data', None)
@@ -371,6 +397,7 @@ class FLOW_OT_brush_native(bpy.types.Operator):
                 space.mode = 'PAINT'      # gives us Blender's own brush cursor
             except Exception:
                 pass
+        self.ensure_brush(context)
 
         # Colour-space caveat: a data texture would want 'Non-Color', but Blender
         # may then round-trip the colour through linear space and the encoded 128
