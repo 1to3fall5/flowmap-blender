@@ -14,6 +14,7 @@ import bpy
 import math
 import numpy as np
 from bpy_extras import view3d_utils
+from mathutils import Euler
 from mathutils.geometry import barycentric_transform, closest_point_on_tri
 
 try:
@@ -1196,6 +1197,90 @@ class FLOW_OT_brush_3d(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
 
+# ------------------------------------------------------- viewing helpers
+#
+# The panel lives in the image editor sidebar, so anything that touches the 3D
+# view has to go find it first.
+
+def find_view3d(context):
+    """(area, space) of the first open 3D view, or (None, None)."""
+    screen = getattr(context, 'screen', None)
+    if screen is None:
+        return None, None
+    for area in screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        space = area.spaces.active
+        if space is not None and getattr(space, 'region_3d', None) is not None:
+            return area, space
+    return None, None
+
+
+class FLOW_OT_preview_camera(bpy.types.Operator):
+    """Aim the 3D view at the dome — orbit it from outside, or look around inside"""
+    bl_idname = "flow.preview_camera"
+    bl_label = "Preview Camera"
+    bl_options = {'REGISTER'}
+
+    mode: bpy.props.EnumProperty(
+        name="Mode",
+        items=(('OUTSIDE', "Frame Dome", "Orbit the dome from outside"),
+               ('INSIDE', "Camera Inside", "Look around from the centre")),
+        default='OUTSIDE')
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(PREVIEW_OBJ)
+        if obj is None:
+            obj = build_preview_dome()
+        if obj is None:
+            self.report({'ERROR'}, "没有天空球")
+            return {'CANCELLED'}
+        area, space = find_view3d(context)
+        if space is None:
+            self.report({'ERROR'}, "没有打开的 3D 视口")
+            return {'CANCELLED'}
+
+        rv3d = space.region_3d
+        # Orbiting rotates around view_location, so putting it at the centre is
+        # what makes the usual middle-drag behave like the web preview.
+        rv3d.view_location = obj.matrix_world.translation
+        rv3d.view_perspective = 'PERSP'
+        if self.mode == 'INSIDE':
+            # Close to the pivot: the dome surrounds you and orbiting reads as
+            # looking around rather than circling the object.
+            rv3d.view_distance = 1.0
+            rv3d.view_rotation = Euler((math.pi, 0.0, 0.0), 'XYZ').to_quaternion()
+        else:
+            rv3d.view_distance = PREVIEW_RADIUS * 3.0
+            rv3d.view_rotation = Euler((math.radians(25.0), 0.0, 0.0), 'XYZ').to_quaternion()
+        area.tag_redraw()
+        return {'FINISHED'}
+
+
+class FLOW_OT_preview_flat(bpy.types.Operator):
+    """Show the dome unlit, so only the flow map is visible"""
+    bl_idname = "flow.preview_flat"
+    bl_label = "Flat Texture View"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        area, space = find_view3d(context)
+        if space is None:
+            self.report({'ERROR'}, "没有打开的 3D 视口")
+            return {'CANCELLED'}
+        shading = space.shading
+        # SOLID shows the object colour rather than the material, which is why
+        # the dome looks like a plain grey cap until this is switched.
+        shading.type = 'MATERIAL'
+        shading.light = 'FLAT'          # no studio light, no shading to fight
+        shading.color_type = 'TEXTURE'
+        shading.use_scene_lights = False
+        shading.use_scene_world = False
+        shading.show_specular_highlight = False
+        area.tag_redraw()
+        return {'FINISHED'}
+
+
 class FLOW_PT_panel(bpy.types.Panel):
     bl_label = "FlowMap"
     bl_idname = "FLOW_PT_panel"
@@ -1218,12 +1303,18 @@ class FLOW_PT_panel(bpy.types.Panel):
         layout.operator("flow.preview_build", icon='WORLD')
         op3d = layout.operator("flow.brush_3d", icon='BRUSH_DATA')
         op3d.strength = context.scene.flow_brush_strength
+
+        row = layout.row(align=True)
+        row.operator("flow.preview_camera", text="Frame Dome").mode = 'OUTSIDE'
+        row.operator("flow.preview_camera", text="Inside").mode = 'INSIDE'
+        layout.operator("flow.preview_flat", icon='SHADING_TEXTURE')
+
         layout.operator("flow.preview_stop", icon='CANCEL')
 
 
 classes = (FLOW_OT_new_canvas, FLOW_OT_brush, FLOW_OT_brush_native,
            FLOW_OT_preview_build, FLOW_OT_preview_stop, FLOW_OT_brush_3d,
-           FLOW_PT_panel)
+           FLOW_OT_preview_camera, FLOW_OT_preview_flat, FLOW_PT_panel)
 
 
 def register():
