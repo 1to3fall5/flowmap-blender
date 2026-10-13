@@ -340,6 +340,95 @@ class FLOW_OT_brush(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+class FLOW_OT_brush_native(bpy.types.Operator):
+    """Paint through Blender's own paint system.
+
+    The trick: Blender draws the dab (cursor, pressure, spacing, smoothing,
+    hardness are all its own), and we only feed it a colour — recomputed from
+    the drag direction on every mouse move. So the interaction and UI are
+    entirely native, but the result is a flow map instead of a colour.
+
+    We never touch pixels ourselves; the events are passed through so Blender's
+    paint system does the stroke.
+    """
+    bl_idname = "flow.brush_native"
+    bl_label = "Flow Brush (Native Paint)"
+    bl_description = "Uses Blender's paint system — native cursor/pressure/brush settings"
+    bl_options = {'REGISTER'}
+
+    def get_brush(self, context):
+        ts = getattr(context, 'tool_settings', None)
+        if ts is None:
+            return None
+        ip = getattr(ts, 'image_paint', None)
+        return getattr(ip, 'brush', None) if ip is not None else None
+
+    def invoke(self, context, event):
+        self.image = get_or_create_canvas()
+        space = getattr(context, 'space_data', None)
+        if space is not None and space.type == 'IMAGE_EDITOR':
+            space.image = self.image
+            try:
+                space.mode = 'PAINT'      # gives us the native brush cursor
+            except Exception:
+                pass
+
+        # NOTE: this is the risky bit. Flow maps are data, so ideally the image
+        # would be 'Non-Color' — but Blender may then convert the brush colour
+        # into linear space and the encoded 128 would not survive. 'sRGB' keeps
+        # the written value closer to what we ask for. Verify by exporting and
+        # checking that untouched pixels read 128.
+        try:
+            self.image.colorspace_settings.name = 'sRGB'
+        except Exception:
+            pass
+
+        brush = self.get_brush(context)
+        if brush is None:
+            self.report({'WARNING'}, "No active image-paint brush available")
+            return {'CANCELLED'}
+        try:
+            brush.blend = 'MIX'
+        except Exception:
+            pass
+
+        self.brush = brush
+        self.last = None
+        self.uv_mode = None
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            if getattr(context, 'workspace', None):
+                context.workspace.status_text_set(None)
+            return {'FINISHED'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            self.last = None
+
+        if event.type == 'MOUSEMOVE':
+            raw, px, self.uv_mode = region_to_pixel(context, event, self.image, self.uv_mode)
+            if px is not None and self.last is not None:
+                dx = px[0] - self.last[0]
+                dy = px[1] - self.last[1]
+                if math.hypot(dx, dy) > 0.5:
+                    r, g, b = direction_to_rgb(dx, dy, max(0.01, self.brush.strength))
+                    try:
+                        self.brush.color = (r, g, b)
+                    except Exception:
+                        pass
+            self.last = px
+            if getattr(context, 'workspace', None):
+                context.workspace.status_text_set(
+                    "Flow Brush (native)  col=(%.2f, %.2f, %.2f)  R=%d  S=%.2f" % (
+                        self.brush.color[0], self.brush.color[1], self.brush.color[2],
+                        self.brush.size, self.brush.strength))
+
+        # Hand the event on so Blender's paint system performs the stroke
+        return {'PASS_THROUGH'}
+
+
 class FLOW_PT_panel(bpy.types.Panel):
     bl_label = "FlowMap"
     bl_idname = "FLOW_PT_panel"
@@ -350,14 +439,21 @@ class FLOW_PT_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.operator("flow.new_canvas", icon='IMAGE_DATA')
+
+        layout.separator()
+        layout.label(text="Custom brush (numpy writes pixels):")
         op = layout.operator("flow.brush", icon='BRUSH_DATA')
         op.radius = context.scene.flow_brush_radius
         op.strength = context.scene.flow_brush_strength
         layout.prop(context.scene, "flow_brush_radius")
         layout.prop(context.scene, "flow_brush_strength")
 
+        layout.separator()
+        layout.label(text="Native paint (Blender draws, we set colour):")
+        layout.operator("flow.brush_native", icon='BRUSH_DATA')
 
-classes = (FLOW_OT_new_canvas, FLOW_OT_brush, FLOW_PT_panel)
+
+classes = (FLOW_OT_new_canvas, FLOW_OT_brush, FLOW_OT_brush_native, FLOW_PT_panel)
 
 
 def register():
