@@ -547,29 +547,53 @@ class FLOW_OT_brush_native(bpy.types.Operator):
         try:
             shader = gpu.shader.from_builtin('UNIFORM_COLOR')
             gpu.state.blend_set('ALPHA')
-            gpu.state.face_set('NONE')   # a stale cull state eats fan triangles
+        except Exception as err:
+            self.note_draw_error(err)
+            return
+        shader.bind()
 
-            # Explicit triangles instead of TRI_FAN: the fan rendered with a
-            # missing wedge (background showing through) on some setups.
+        # Fill and outline are drawn independently: if the fill batch ever fails
+        # the ring must still appear, instead of the whole overlay vanishing.
+        #
+        # Explicit triangles rather than TRI_FAN, which rendered with a missing
+        # wedge on some setups.
+        try:
             tris = []
             for i in range(steps):
                 tris.append((cx, cy, 0.0))
                 tris.append(pts[i])
                 tris.append(pts[i + 1])
             fill = batch_for_shader(shader, 'TRIS', {"pos": tris})
-            outline = batch_for_shader(shader, 'LINE_STRIP', {"pos": pts})
-
-            shader.bind()
-            # A hint, not a sticker: overlays are drawn linear and then get the
-            # sRGB transform, so even 0.10 alpha reads as a solid grey disc.
+            # A hint, not a sticker: POST_PIXEL overlays composite linear and
+            # then get the sRGB transform, so even 0.1 reads as a grey disc.
             shader.uniform_float("color", (1.0, 1.0, 1.0, 0.02 + self.strength * 0.08))
             fill.draw(shader)
+        except Exception as err:
+            self.note_draw_error(err)
+
+        try:
+            outline = batch_for_shader(shader, 'LINE_STRIP', {"pos": pts})
             shader.uniform_float("color", (1.0, 1.0, 1.0, 0.9))
             outline.draw(shader)
+        except Exception as err:
+            self.note_draw_error(err)
 
+        try:
             gpu.state.blend_set('NONE')
         except Exception:
             pass
+
+    def note_draw_error(self, err):
+        """Report the first overlay failure once instead of silently drawing nothing.
+
+        The draw handler runs every frame, so a print inside it would flood the
+        console — but swallowing the error entirely means the cursor just
+        disappears with no clue why.
+        """
+        if getattr(self, '_draw_error_reported', False):
+            return
+        self._draw_error_reported = True
+        print("[FlowMap] brush overlay failed: %r" % (err,))
 
     def modal(self, context, event):
         if event.type in {'RIGHTMOUSE', 'ESC'}:
