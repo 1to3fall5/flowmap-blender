@@ -9,6 +9,7 @@ bl_info = {
     "category": "Paint",
 }
 
+import bmesh
 import bpy
 import math
 import numpy as np
@@ -661,6 +662,276 @@ class FLOW_OT_brush_native(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
 
+# --------------------------------------------------------------- sky preview
+#
+# Without this the add-on is only a brush that paints direction colours, which
+# is exactly what the existing flow map painters already do. A flow map exists
+# to move something, so the preview puts the canvas on a hemisphere and scrolls
+# a procedural grid across it — no image asset needed, and it keeps animating
+# while you paint.
+
+PREVIEW_OBJ = "FlowMapPreview"
+PREVIEW_MAT = "FlowMapPreviewMat"
+PREVIEW_RADIUS = 10.0
+PREVIEW_GRID = 24.0      # grid cells across the dome
+PREVIEW_TICK = 0.04      # timer interval in seconds
+PREVIEW_SPEED = 0.5      # one grid cell of travel per 2 s at full strength
+
+_preview_time = 0.0
+_preview_timer = False
+
+
+def build_preview_dome():
+    """Upper hemisphere. Blender's sphere UVs are kept: v = 0 south .. 1 north."""
+    obj = bpy.data.objects.get(PREVIEW_OBJ)
+    if obj is not None:
+        return obj
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=96, ring_count=48,
+                                         radius=PREVIEW_RADIUS,
+                                         location=(0.0, 0.0, 0.0))
+    obj = bpy.context.object
+    if obj is None:
+        return None
+    obj.name = PREVIEW_OBJ
+    obj.data.name = PREVIEW_OBJ + "Mesh"
+
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    lower = [f for f in bm.faces if f.calc_center_median().z < 0.0]
+    if lower:
+        bmesh.ops.delete(bm, geom=lower, context='FACES')
+    orphans = [v for v in bm.verts if not v.link_faces]
+    if orphans:
+        bmesh.ops.delete(bm, geom=orphans, context='VERTS')
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+    return obj
+
+
+def build_preview_material(image):
+    """A grid scrolled by the flow map. Emission only, so no lights are needed."""
+    mat = bpy.data.materials.get(PREVIEW_MAT)
+    if mat is None:
+        mat = bpy.data.materials.new(PREVIEW_MAT)
+    mat.use_nodes = True
+    try:
+        mat.use_backface_culling = False      # visible from inside the dome
+    except Exception:
+        pass
+
+    tree = mat.node_tree
+    nodes, links = tree.nodes, tree.links
+    nodes.clear()
+
+    def add(kind, name):
+        n = nodes.new(kind)
+        n.name = name
+        n.label = name
+        return n
+
+    def val(node, index, value):
+        node.inputs[index].default_value = value
+
+    out = add("ShaderNodeOutputMaterial", "Output")
+    emit = add("ShaderNodeEmission", "Emission")
+    links.new(emit.outputs[0], out.inputs[0])
+
+    # --- UV ---
+    # The hemisphere sits in v = 0.5..1 of the sphere UVs. Rescale it to 0..1 so
+    # the whole canvas lands on the dome: v = 0 horizon, v = 1 zenith.
+    texco = add("ShaderNodeTexCoord", "UV")
+    sep = add("ShaderNodeSeparateXYZ", "SepUV")
+    links.new(texco.outputs["UV"], sep.inputs[0])
+    vsub = add("ShaderNodeMath", "VSub")
+    vsub.operation = 'SUBTRACT'
+    val(vsub, 1, 0.5)
+    links.new(sep.outputs[1], vsub.inputs[0])        # UV.y is output 1
+    vmul = add("ShaderNodeMath", "VMul")
+    vmul.operation = 'MULTIPLY'
+    val(vmul, 1, 2.0)
+    links.new(vsub.outputs[0], vmul.inputs[0])
+    comb = add("ShaderNodeCombineXYZ", "DomeUV")
+    links.new(sep.outputs[0], comb.inputs[0])
+    links.new(vmul.outputs[0], comb.inputs[1])
+    dome_uv = comb.outputs[0]
+
+    # --- flow vector ---
+    # The canvas is an sRGB image, so sampling linearises it (128 -> 0.216).
+    # Undo with pow(1/2.2) so neutral lands back on 0.5 — otherwise an unpainted
+    # sky would drift in one direction instead of standing still.
+    flow_tex = add("ShaderNodeTexImage", "FlowMap")
+    flow_tex.image = image
+    links.new(dome_uv, flow_tex.inputs[0])
+
+    srgb = add("ShaderNodeSeparateRGB", "SplitFlow")
+    links.new(flow_tex.outputs["Color"], srgb.inputs[0])
+    pow_r = add("ShaderNodeMath", "DecodeR")
+    pow_r.operation = 'POWER'
+    val(pow_r, 1, 1.0 / 2.2)
+    links.new(srgb.outputs[0], pow_r.inputs[0])
+    pow_g = add("ShaderNodeMath", "DecodeG")
+    pow_g.operation = 'POWER'
+    val(pow_g, 1, 1.0 / 2.2)
+    links.new(srgb.outputs[1], pow_g.inputs[0])
+    decoded = add("ShaderNodeCombineXYZ", "Decoded")
+    links.new(pow_r.outputs[0], decoded.inputs[0])
+    links.new(pow_g.outputs[0], decoded.inputs[1])
+
+    bias = add("ShaderNodeVectorMath", "FlowBias")
+    bias.operation = 'SUBTRACT'
+    val(bias, 1, (0.5, 0.5, 0.5))
+    links.new(decoded.outputs[0], bias.inputs[0])
+    # Vector Math keeps a fourth 'Scale' float socket at index 3 — not index 1,
+    # which is a vector.
+    flow = add("ShaderNodeVectorMath", "Flow")
+    flow.operation = 'SCALE'
+    val(flow, 3, 2.0)
+    links.new(bias.outputs[0], flow.inputs[0])
+
+    # --- time ---
+    time = add("ShaderNodeValue", "Time")
+    time.outputs[0].default_value = _preview_time
+    phase = add("ShaderNodeMath", "Phase")
+    phase.operation = 'FRACT'
+    links.new(time.outputs[0], phase.inputs[0])
+
+    # --- scrolling ---
+    # A single layer, because the pattern is periodic: shifting the grid by a
+    # whole cell looks exactly like not shifting it, so offsetting by frac(time)
+    # loops seamlessly with no reset to hide.
+    #
+    # The usual two-layer cross-fade (offsets t and t+0.5, blended) is meant for
+    # distorting a texture where the wrap would show. Here it is actively wrong:
+    # it returns to the unshifted image twice per cycle, so the sky breathes in
+    # place instead of travelling in the painted direction.
+    base = add("ShaderNodeVectorMath", "GridUV")
+    base.operation = 'SCALE'
+    val(base, 3, PREVIEW_GRID)
+    links.new(dome_uv, base.inputs[0])
+
+    off = add("ShaderNodeVectorMath", "Offset")
+    off.operation = 'SCALE'
+    links.new(flow.outputs[0], off.inputs[0])
+    links.new(phase.outputs[0], off.inputs[3])       # 'Scale' socket
+
+    scrolled = add("ShaderNodeVectorMath", "ScrollUV")
+    scrolled.operation = 'ADD'
+    links.new(base.outputs[0], scrolled.inputs[0])
+    links.new(off.outputs[0], scrolled.inputs[1])
+
+    def grid(name, uv_socket):
+        """1 on a grid line, 0 midway between two lines."""
+        fr = add("ShaderNodeVectorMath", name + "Frac")
+        fr.operation = 'FRACTION'
+        links.new(uv_socket, fr.inputs[0])
+        sub = add("ShaderNodeVectorMath", name + "Sub")
+        sub.operation = 'SUBTRACT'
+        val(sub, 1, (0.5, 0.5, 0.5))
+        links.new(fr.outputs[0], sub.inputs[0])
+        ab = add("ShaderNodeVectorMath", name + "Abs")
+        ab.operation = 'ABSOLUTE'
+        links.new(sub.outputs[0], ab.inputs[0])
+        s2 = add("ShaderNodeSeparateXYZ", name + "Sep")
+        links.new(ab.outputs[0], s2.inputs[0])
+        m = add("ShaderNodeMath", name + "Min")
+        m.operation = 'MINIMUM'
+        links.new(s2.outputs[0], m.inputs[0])
+        links.new(s2.outputs[1], m.inputs[1])
+        div = add("ShaderNodeMath", name + "Width")
+        div.operation = 'DIVIDE'
+        val(div, 1, 0.09)          # line half-width, in grid cells
+        links.new(m.outputs[0], div.inputs[0])
+        cl = add("ShaderNodeMath", name + "Clamp")
+        cl.operation = 'MINIMUM'
+        val(cl, 1, 1.0)
+        links.new(div.outputs[0], cl.inputs[0])
+        inv = add("ShaderNodeMath", name + "Line")
+        inv.operation = 'SUBTRACT'
+        val(inv, 0, 1.0)
+        links.new(cl.outputs[0], inv.inputs[1])
+        return inv.outputs[0]
+
+    g = grid("Grid", scrolled.outputs[0])
+
+    tint = add("ShaderNodeMixRGB", "Tint")
+    links.new(g, tint.inputs["Fac"])
+    val(tint, 1, (0.015, 0.02, 0.035, 1.0))
+    val(tint, 2, (0.55, 0.85, 1.0, 1.0))
+    links.new(tint.outputs[0], emit.inputs[0])
+    return mat
+
+
+def _preview_tick():
+    """Advance the shader's clock; Blender materials do not animate themselves."""
+    global _preview_time, _preview_timer
+    mat = bpy.data.materials.get(PREVIEW_MAT)
+    node = mat.node_tree.nodes.get("Time") if mat and mat.use_nodes else None
+    if node is None:
+        _preview_timer = False
+        return None
+    _preview_time += PREVIEW_TICK * PREVIEW_SPEED
+    node.outputs[0].default_value = _preview_time
+    try:
+        mat.update_tag()
+    except Exception:
+        pass
+    return PREVIEW_TICK
+
+
+def start_preview_timer():
+    global _preview_timer
+    if _preview_timer:
+        return
+    _preview_timer = True
+    bpy.app.timers.register(_preview_tick, first_interval=PREVIEW_TICK)
+
+
+def stop_preview_timer():
+    global _preview_timer
+    _preview_timer = False
+    try:
+        bpy.app.timers.unregister(_preview_tick)
+    except Exception:
+        pass
+
+
+class FLOW_OT_preview_build(bpy.types.Operator):
+    """Show the canvas as a sky dome with the flow scrolling a grid across it"""
+    bl_idname = "flow.preview_build"
+    bl_label = "Preview Sky Dome"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        image = get_or_create_canvas()
+        obj = build_preview_dome()
+        if obj is None:
+            self.report({'ERROR'}, "无法创建预览球体")
+            return {'CANCELLED'}
+        mat = build_preview_material(image)
+        if obj.data.materials:
+            obj.data.materials[0] = mat
+        else:
+            obj.data.materials.append(mat)
+        start_preview_timer()
+        self.report({'INFO'}, "预览已创建（贴图上半=地平线，顶部=天顶）")
+        return {'FINISHED'}
+
+
+class FLOW_OT_preview_stop(bpy.types.Operator):
+    """Remove the preview dome and stop its timer"""
+    bl_idname = "flow.preview_stop"
+    bl_label = "Stop Preview"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        stop_preview_timer()
+        obj = bpy.data.objects.get(PREVIEW_OBJ)
+        if obj is not None:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        return {'FINISHED'}
+
+
 class FLOW_PT_panel(bpy.types.Panel):
     bl_label = "FlowMap"
     bl_idname = "FLOW_PT_panel"
@@ -678,9 +949,14 @@ class FLOW_PT_panel(bpy.types.Panel):
         op = layout.operator("flow.brush_native", icon='BRUSH_DATA')
         op.strength = context.scene.flow_brush_strength
         layout.prop(context.scene, "flow_brush_strength", text="Flow Strength")
+        layout.separator()
+        layout.label(text="Preview")
+        layout.operator("flow.preview_build", icon='WORLD')
+        layout.operator("flow.preview_stop", icon='CANCEL')
 
 
-classes = (FLOW_OT_new_canvas, FLOW_OT_brush, FLOW_OT_brush_native, FLOW_PT_panel)
+classes = (FLOW_OT_new_canvas, FLOW_OT_brush, FLOW_OT_brush_native,
+           FLOW_OT_preview_build, FLOW_OT_preview_stop, FLOW_PT_panel)
 
 
 def register():
@@ -693,6 +969,7 @@ def register():
 
 
 def unregister():
+    stop_preview_timer()
     del bpy.types.Scene.flow_brush_radius
     del bpy.types.Scene.flow_brush_strength
     for cls in reversed(classes):
