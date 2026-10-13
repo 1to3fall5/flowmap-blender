@@ -341,27 +341,26 @@ class FLOW_OT_brush(bpy.types.Operator):
 
 
 class FLOW_OT_brush_native(bpy.types.Operator):
-    """Paint through Blender's own paint system.
+    """Paint a flow map using Blender's paint engine.
 
-    The trick: Blender draws the dab (cursor, pressure, spacing, smoothing,
-    hardness are all its own), and we only feed it a colour — recomputed from
-    the drag direction on every mouse move. So the interaction and UI are
-    entirely native, but the result is a flow map instead of a colour.
+    Blender builds the dab (shape, hardness, pressure) — we only feed it a colour
+    derived from the drag direction, recomputed before every dab.
 
-    We never touch pixels ourselves; the events are passed through so Blender's
-    paint system does the stroke.
+    The stroke is driven explicitly through bpy.ops.paint.image_paint() rather
+    than by passing mouse events through. Blender's own stroke handling reads the
+    brush colour once per stroke, so PASS_THROUGH would paint a single flat
+    colour — that is why this cannot simply delegate the drag. The technique
+    follows Clemens Beute's flow_map_painter.
     """
     bl_idname = "flow.brush_native"
     bl_label = "Flow Brush (Native Paint)"
-    bl_description = "Uses Blender's paint system — native cursor/pressure/brush settings"
+    bl_description = "Uses Blender's paint engine — native brush settings, pressure and cursor"
     bl_options = {'REGISTER'}
 
-    def get_brush(self, context):
-        ts = getattr(context, 'tool_settings', None)
-        if ts is None:
-            return None
-        ip = getattr(ts, 'image_paint', None)
-        return getattr(ip, 'brush', None) if ip is not None else None
+    # Flow strength: how far the encoded direction deviates from neutral.
+    # Deliberately not unified_paint_settings.strength, which is also the dab
+    # opacity — using it for both attenuates twice and low values paint nothing.
+    strength: bpy.props.FloatProperty(name="Strength", default=0.5, min=0.01, max=1.0)
 
     def invoke(self, context, event):
         self.image = get_or_create_canvas()
@@ -369,63 +368,118 @@ class FLOW_OT_brush_native(bpy.types.Operator):
         if space is not None and space.type == 'IMAGE_EDITOR':
             space.image = self.image
             try:
-                space.mode = 'PAINT'      # gives us the native brush cursor
+                space.mode = 'PAINT'      # gives us Blender's own brush cursor
             except Exception:
                 pass
 
-        # NOTE: this is the risky bit. Flow maps are data, so ideally the image
-        # would be 'Non-Color' — but Blender may then convert the brush colour
-        # into linear space and the encoded 128 would not survive. 'sRGB' keeps
-        # the written value closer to what we ask for. Verify by exporting and
-        # checking that untouched pixels read 128.
+        # Colour-space caveat: a data texture would want 'Non-Color', but Blender
+        # may then round-trip the colour through linear space and the encoded 128
+        # would not survive. Verify by exporting: untouched pixels should read 128.
         try:
             self.image.colorspace_settings.name = 'sRGB'
         except Exception:
             pass
 
-        brush = self.get_brush(context)
-        if brush is None:
-            self.report({'WARNING'}, "No active image-paint brush available")
-            return {'CANCELLED'}
-        try:
-            brush.blend = 'MIX'
-        except Exception:
-            pass
+        # Unified settings are what Blender's brush panel drives, so the sidebar
+        # stays live for size / strength / colour.
+        ups = context.scene.tool_settings.unified_paint_settings
+        ups.use_unified_color = True
+        ups.use_unified_size = True
+        ups.use_unified_strength = True
+        self.ups = ups
 
-        self.brush = brush
-        self.last = None
-        self.uv_mode = None
+        self.pressing = False
+        self.last_mouse = None     # window coords — the direction comes from these
+        self.last_dot = None       # where the previous dab landed
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
+    def finish(self, context):
+        try:
+            self.ups.color = (0.5, 0.5, 1.0)
+        except Exception:
+            pass
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+    def place_dot(self, context, mouse):
+        """One dab, produced by Blender's paint engine."""
+        area = context.area
+        if area is None:
+            return
+        local = (mouse[0] - area.x, mouse[1] - area.y)
+        stroke = [{
+            "name": "",
+            "is_start": True,
+            "location": (0, 0, 0),
+            "mouse": local,
+            "mouse_event": local,
+            "pressure": 1.0,
+            "size": self.ups.size,
+            "time": 1,
+            "x_tilt": 0,
+            "y_tilt": 0,
+        }]
+        try:
+            bpy.ops.paint.image_paint(stroke=stroke, mode='NORMAL')
+        except Exception:
+            pass
+
+    def paint_dots(self, context, mouse):
+        """Space dabs along the drag, interpolating when the mouse moves fast."""
+        spacing = max(2.0, self.ups.size * 0.15)
+        if self.last_dot is None:
+            self.place_dot(context, mouse)
+            self.last_dot = mouse
+            return
+        dx = mouse[0] - self.last_dot[0]
+        dy = mouse[1] - self.last_dot[1]
+        dist = math.hypot(dx, dy)
+        if dist < spacing:
+            return
+        steps = int(dist / spacing)
+        for i in range(1, steps + 1):
+            t = i / steps
+            self.place_dot(context, (self.last_dot[0] + dx * t, self.last_dot[1] + dy * t))
+        self.last_dot = mouse
+
     def modal(self, context, event):
         if event.type in {'RIGHTMOUSE', 'ESC'}:
-            if getattr(context, 'workspace', None):
-                context.workspace.status_text_set(None)
-            return {'FINISHED'}
+            return self.finish(context)
 
-        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
-            self.last = None
+        if event.type == 'LEFTMOUSE':
+            if event.value == 'PRESS':
+                self.pressing = True
+                self.last_dot = None
+            elif event.value == 'RELEASE':
+                self.pressing = False
+                self.last_dot = None
+            return {'RUNNING_MODAL'}
 
         if event.type == 'MOUSEMOVE':
-            raw, px, self.uv_mode = region_to_pixel(context, event, self.image, self.uv_mode)
-            if px is not None and self.last is not None:
-                dx = px[0] - self.last[0]
-                dy = px[1] - self.last[1]
-                if math.hypot(dx, dy) > 0.5:
-                    r, g, b = direction_to_rgb(dx, dy, max(0.01, self.brush.strength))
+            mouse = (event.mouse_x, event.mouse_y)
+
+            if self.last_mouse is not None:
+                dx = mouse[0] - self.last_mouse[0]
+                dy = mouse[1] - self.last_mouse[1]
+                if math.hypot(dx, dy) > 0.0:
+                    # window Y grows upward, and so do image rows
+                    r, g, b = direction_to_rgb(dx, dy, self.strength)
                     try:
-                        self.brush.color = (r, g, b)
+                        self.ups.color = (r, g, b)
                     except Exception:
                         pass
-            self.last = px
-            if getattr(context, 'workspace', None):
-                context.workspace.status_text_set(
-                    "Flow Brush (native)  col=(%.2f, %.2f, %.2f)  R=%d  S=%.2f" % (
-                        self.brush.color[0], self.brush.color[1], self.brush.color[2],
-                        self.brush.size, self.brush.strength))
 
-        # Hand the event on so Blender's paint system performs the stroke
+            if self.pressing:
+                self.paint_dots(context, mouse)
+
+            self.last_mouse = mouse
+            if context.area:
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        # let Blender handle F / Shift+F sizing and everything else
         return {'PASS_THROUGH'}
 
 
@@ -443,7 +497,9 @@ class FLOW_PT_panel(bpy.types.Panel):
         layout = self.layout
         layout.operator("flow.new_canvas", icon='IMAGE_DATA')
         layout.separator()
-        layout.operator("flow.brush_native", icon='BRUSH_DATA')
+        op = layout.operator("flow.brush_native", icon='BRUSH_DATA')
+        op.strength = context.scene.flow_brush_strength
+        layout.prop(context.scene, "flow_brush_strength", text="Flow Strength")
 
 
 classes = (FLOW_OT_new_canvas, FLOW_OT_brush, FLOW_OT_brush_native, FLOW_PT_panel)
